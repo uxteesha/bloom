@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bloom — A Digital Flower Garden</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #05060a;
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    color: #e6e0d4;
+    cursor: none;
+  }
+
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+
+  /* Webcam is always hidden — used only as MediaPipe input */
+  #webcam {
+    position: fixed; width: 1px; height: 1px;
+    opacity: 0; pointer-events: none;
+  }
+
+  /* Intro overlay */
+  #intro {
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse at center, rgba(10,12,20,0.85) 0%, rgba(2,3,6,0.97) 80%);
+    z-index: 10;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center;
+    transition: opacity 1.6s ease;
+    cursor: pointer;
+  }
+  #intro h1 {
+    font-weight: 200; font-size: 64px; letter-spacing: 14px;
+    margin: 0 0 24px 0; color: #f3ead8;
+    text-shadow: 0 0 30px rgba(200,170,255,0.4);
+  }
+  #intro p {
+    font-weight: 300; font-size: 14px; letter-spacing: 4px;
+    text-transform: uppercase; color: #b9b3a5;
+    max-width: 520px; line-height: 2; margin: 6px 0;
+  }
+  .hint {
+    margin-top: 48px; font-size: 11px; letter-spacing: 6px;
+    color: #8a8576; text-transform: uppercase;
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }
+  #intro.hidden { opacity: 0; pointer-events: none; }
+
+  /* HUD */
+  #hud {
+    position: fixed; bottom: 24px; left: 0; right: 0;
+    text-align: center; z-index: 5;
+    font-size: 10px; letter-spacing: 5px; text-transform: uppercase;
+    color: rgba(230,224,212,0.35); pointer-events: none;
+  }
+  #hud span { display: inline-block; margin: 0 30px; }
+</style>
+</head>
+<body>
+
+<video id="webcam" autoplay playsinline muted></video>
+
+<div id="intro">
+  <h1>BLOOM</h1>
+  <p>A Garden Grown by Hand</p>
+  <p style="margin-top:30px;opacity:0.7;">Left pinch — grow the stems</p>
+  <p style="opacity:0.7;">Right pinch — open the bloom</p>
+  <p style="opacity:0.45;font-size:11px;margin-top:14px;">Move your pinch to grow · pause to freeze</p>
+  <div class="hint">click anywhere to begin</div>
+</div>
+
+<div id="hud">
+  <span>stem · <span id="stem-val">—</span></span>
+  <span>bloom · <span id="bloom-val">—</span></span>
+</div>
+
+<script>
+/* =========================================================================
+   BLOOM — A Digital Flower Garden
+   =========================================================================
+   GESTURE MODEL
+   • Both hands use thumb-tip ↔ index-tip PINCH distance.
+   • Mapped to calibrated finger range: ~0.02 (closed) → 0.18 (open).
+   • Growth driven by PINCH VELOCITY:
+       moving pinch  → flower follows the gesture
+       still  pinch  → flower freezes at current state
+   • Instant response — first frame of motion already drives growth.
+   ========================================================================= */
+
+/* ---------- Globals ---------- */
+let stemTarget  = 0.0;   // set by left hand pinch
+let bloomTarget = 0.0;   // set by right hand pinch
+let stemAmount  = 0.0;   // smoothed value used by flowers
+let bloomAmount = 0.0;
+
+let leftHandLastSeen  = -9999;
+let rightHandLastSeen = -9999;
+const HAND_TIMEOUT = 800; // ms before we consider a hand gone
+
+// Velocity tracking: motion = grow, stillness = freeze
+let leftPrevPinch  = null, rightPrevPinch  = null;
+let leftPinchVel   = 0,    rightPinchVel   = 0;
+const VEL_MIN = 0.0006;  // below this → frozen
+const VEL_MAX = 0.012;   // above this → full speed
+
+let flowers = [], ambientParticles = [];
+const NUM_FLOWERS = 9, NUM_AMBIENT = 220;
+let glowLayer, trailLayer;
+
+const PALETTE = [
+  [255,180,220],[180,220,255],[220,200,255],
+  [255,220,180],[200,255,220],[255,200,240],
+];
+
+/* ---------- MediaPipe ---------- */
+
+const videoEl = document.getElementById('webcam');
+
+const hands = new Hands({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+hands.setOptions({
+  maxNumHands: 2, modelComplexity: 1,
+  minDetectionConfidence: 0.6, minTrackingConfidence: 0.6
+});
+hands.onResults(onHandResults);
+
+function onHandResults(results) {
+  if (!results.multiHandLandmarks?.length) return;
+
+  for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+    const lm  = results.multiHandLandmarks[i];
+    // MediaPipe sees a mirrored feed — flip labels to match the real user
+    const side = (results.multiHandedness[i].label === 'Left') ? 'Right' : 'Left';
+
+    // Pinch = thumb tip (4) ↔ index tip (8)
+    const dx = lm[4].x - lm[8].x, dy = lm[4].y - lm[8].y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    // Map the realistic finger range to 0..1
+    const PMIN = 0.02, PMAX = 0.18;
+    const mapped = Math.max(0, Math.min(1, (dist - PMIN) / (PMAX - PMIN)));
+
+    if (side === 'Left') {
+      if (leftPrevPinch !== null)
+        leftPinchVel = leftPinchVel * 0.5 + Math.abs(dist - leftPrevPinch) * 0.5;
+      leftPrevPinch = dist;
+      stemTarget = mapped;
+      leftHandLastSeen = millis();
+    } else {
+      if (rightPrevPinch !== null)
+        rightPinchVel = rightPinchVel * 0.5 + Math.abs(dist - rightPrevPinch) * 0.5;
+      rightPrevPinch = dist;
+      bloomTarget = mapped;
+      rightHandLastSeen = millis();
+    }
+  }
+}
+
+/* ---------- Camera ---------- */
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+    audio: false
+  });
+  videoEl.srcObject = stream;
+  await videoEl.play();
+  if (videoEl.readyState < 2)
+    await new Promise(r => videoEl.addEventListener('loadeddata', r, { once: true }));
+
+  let busy = false;
+  async function loop() {
+    if (!busy && videoEl.readyState >= 2) {
+      busy = true;
+      try { await hands.send({ image: videoEl }); } catch(e) { console.warn(e); }
+      busy = false;
+    }
+    requestAnimationFrame(loop);
+  }
+  loop();
+}
+
+/* ---------- p5 setup ---------- */
+
+function setup() {
+  createCanvas(windowWidth, windowHeight).position(0, 0);
+
+  glowLayer  = createGraphics(windowWidth, windowHeight);
+  trailLayer = createGraphics(windowWidth, windowHeight);
+  trailLayer.background(0);
+
+  for (let i = 0; i < NUM_FLOWERS; i++) {
+    const t = i / (NUM_FLOWERS - 1);
+    const x = lerp(width * 0.10, width * 0.90, t) + random(-width*0.03, width*0.03);
+    flowers.push(new Flower(x, height * 0.92, random(0.55, 1.0), i));
+  }
+  flowers.sort((a, b) => a.depth - b.depth);
+
+  for (let i = 0; i < NUM_AMBIENT; i++) ambientParticles.push(new AmbientParticle());
+  noStroke();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  glowLayer  = createGraphics(windowWidth, windowHeight);
+  trailLayer = createGraphics(windowWidth, windowHeight);
+  trailLayer.background(0);
+  flowers.forEach((f, i) => {
+    const t = i / (NUM_FLOWERS - 1);
+    f.baseX = lerp(width * 0.10, width * 0.90, t);
+    f.baseY = height * 0.92;
+  });
+}
+
+/* ---------- p5 draw ---------- */
+
+function draw() {
+  const now = millis();
+
+  // Decay velocity when hand disappears so things freeze cleanly
+  if (now - leftHandLastSeen  > HAND_TIMEOUT) { leftPinchVel  *= 0.85; leftPrevPinch  = null; }
+  if (now - rightHandLastSeen > HAND_TIMEOUT) { rightPinchVel *= 0.85; rightPrevPinch = null; }
+
+  // Velocity → lerp factor: moving = grow, still = freeze
+  const stemFactor  = velToFactor(leftPinchVel);
+  const bloomFactor = velToFactor(rightPinchVel);
+  stemAmount  = lerp(stemAmount,  stemTarget,  stemFactor);
+  bloomAmount = lerp(bloomAmount, bloomTarget, bloomFactor);
+
+  // HUD
+  document.getElementById('stem-val').textContent  = stemAmount.toFixed(2)  + (stemFactor  > 0.01 ? ' ●' : ' ·');
+  document.getElementById('bloom-val').textContent = bloomAmount.toFixed(2) + (bloomFactor > 0.01 ? ' ●' : ' ·');
+
+  // Atmospheric background
+  drawAtmosphere();
+
+  // Ambient pollen trails (fading on a persistent layer)
+  trailLayer.noStroke();
+  trailLayer.fill(0, 0, 0, 18);
+  trailLayer.rect(0, 0, width, height);
+  for (const p of ambientParticles) { p.update(); p.draw(trailLayer); }
+  push(); blendMode(SCREEN); image(trailLayer, 0, 0); blendMode(BLEND); pop();
+
+  // Flowers
+  glowLayer.clear();
+  for (const f of flowers) { f.update(); f.draw(this, glowLayer); }
+
+  // Composite glow (drawn multiple times offset = cheap bloom blur)
+  push(); blendMode(ADD);
+  tint(255, 90); image(glowLayer, 0, 0);
+  tint(255, 60); image(glowLayer,-2,-1); image(glowLayer,2,1);
+  tint(255, 40); image(glowLayer,-4,-3); image(glowLayer,4,3);
+  noTint(); blendMode(BLEND); pop();
+
+  // Vignette + fog
+  drawVignette();
+  drawFog();
+}
+
+function velToFactor(v) {
+  if (v <= VEL_MIN) return 0;
+  if (v >= VEL_MAX) return 0.18;
+  return ((v - VEL_MIN) / (VEL_MAX - VEL_MIN)) * 0.18;
+}
+
+function drawAtmosphere() {
+  const topR=lerp(8,20,bloomAmount), topG=lerp(10,14,bloomAmount), topB=lerp(20,32,bloomAmount);
+  const botR=lerp(4,10,bloomAmount), botG=lerp(5,8,bloomAmount),   botB=lerp(12,20,bloomAmount);
+  noStroke();
+  for (let y = 0; y < height; y += 4) {
+    const t = y / height;
+    fill(lerp(topR,botR,t), lerp(topG,botG,t), lerp(topB,botB,t));
+    rect(0, y, width, 4);
+  }
+}
+
+function drawVignette() {
+  push(); noFill();
+  for (let i = 0; i < 60; i++) {
+    stroke(0, 0, 6, map(i, 0, 60, 0, 90));
+    strokeWeight(2);
+    ellipse(width/2, height/2, width*1.6 - i*6, height*1.8 - i*6);
+  }
+  pop();
+}
+
+function drawFog() {
+  push(); noStroke();
+  const t = millis() * 0.00005;
+  for (let i = 0; i < 3; i++) {
+    fill(20, 18, 30, 6);
+    rect(0, height*0.3 + sin(t+i)*40 + i*80, width, 200);
+  }
+  pop();
+}
+
+/* ---------- Flower ---------- */
+
+class Flower {
+  constructor(x, y, depth, idx) {
+    this.baseX = x; this.baseY = y; this.depth = depth; this.idx = idx;
+    this.colorIdx    = floor(random(PALETTE.length));
+    this.petalCount  = floor(random(6, 9));
+    this.swayPhase   = random(TWO_PI);
+    this.swaySpeed   = random(0.0005, 0.0012);
+    this.stemPersonal  = random(0.85, 1.15);
+    this.bloomPersonal = random(0.80, 1.20);
+    this.bloomOffset   = random(-0.08, 0.08);
+    this.stemH = 0; this.bloomP = 0;
+    this.particles = []; this.particleCooldown = 0;
+  }
+
+  update() {
+    const maxStem = height * 0.55 * this.depth;
+    const minStem = 30 * this.depth;
+    const sT = lerp(minStem, maxStem, Math.max(0, Math.min(1, stemAmount * this.stemPersonal)));
+    this.stemH = lerp(this.stemH, sT, 0.08);
+
+    const bP = Math.max(0, Math.min(1, bloomAmount * this.bloomPersonal + this.bloomOffset));
+    this.bloomP = lerp(this.bloomP, bP, 0.07);
+
+    if (this.bloomP > 0.85 && this.particleCooldown <= 0) {
+      const h = this.head();
+      this.particles.push(new Spore(h.x, h.y, this.colorIdx, this.depth));
+      this.particleCooldown = random(2, 8);
+    }
+    this.particleCooldown--;
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      this.particles[i].update();
+      if (this.particles[i].dead) this.particles.splice(i, 1);
+    }
+  }
+
+  head() {
+    const sway = sin(millis() * this.swaySpeed + this.swayPhase) * 12 * (this.stemH / 200);
+    return { x: this.baseX + sway, y: this.baseY - this.stemH };
+  }
+
+  draw(mc, gc) {
+    const h = this.head();
+    const c = PALETTE[this.colorIdx];
+
+    // Stem
+    mc.push(); mc.noFill();
+    mc.stroke(120, 160, 130, lerp(40, 140, this.depth));
+    mc.strokeWeight(1.2 * this.depth);
+    const cx = lerp(this.baseX, h.x, 0.5) + sin(millis()*this.swaySpeed*1.3+this.swayPhase)*18*this.depth;
+    const cy = (this.baseY + h.y) / 2;
+    mc.bezier(this.baseX, this.baseY, cx, cy, cx, cy, h.x, h.y);
+    mc.pop();
+
+    if (this.bloomP < 0.05) return;
+
+    const ps = 22 * this.depth * easeOutCubic(this.bloomP);
+    const rot = millis() * 0.0002 + this.idx * 0.7;
+
+    // Outer glow halo
+    gc.push(); gc.translate(h.x, h.y); gc.noStroke();
+    const gr = ps * 4 * (0.5 + this.bloomP * 0.8);
+    for (let i = 5; i > 0; i--) {
+      gc.fill(c[0], c[1], c[2], (this.bloomP * 60) / i);
+      gc.ellipse(0, 0, gr*(i/4), gr*(i/4));
+    }
+    gc.pop();
+
+    // Petals
+    mc.push(); mc.translate(h.x, h.y); mc.rotate(rot); mc.noStroke();
+    for (let i = 0; i < this.petalCount; i++) {
+      const ang = (TWO_PI / this.petalCount) * i;
+      mc.push(); mc.rotate(ang); mc.translate(ps*0.6, 0);
+      for (let j = 4; j > 0; j--) {
+        mc.fill(c[0], c[1], c[2], lerp(20,180,this.bloomP)/j);
+        mc.ellipse(0, 0, ps*(j/3), ps*0.5*(j/3));
+      }
+      mc.pop();
+
+      // Same petals on glow layer
+      gc.push(); gc.translate(h.x, h.y); gc.rotate(rot+ang); gc.translate(ps*0.6, 0);
+      gc.noStroke(); gc.fill(c[0], c[1], c[2], 90*this.bloomP);
+      gc.ellipse(0, 0, ps*1.1, ps*0.55);
+      gc.pop();
+    }
+    mc.pop();
+
+    // Pistil
+    mc.push(); mc.translate(h.x, h.y); mc.noStroke();
+    mc.fill(255,240,200, 200*this.bloomP); mc.ellipse(0,0, ps*0.45, ps*0.45);
+    mc.fill(255,255,230, 255*this.bloomP); mc.ellipse(0,0, ps*0.22, ps*0.22);
+    mc.pop();
+    gc.push(); gc.translate(h.x, h.y); gc.noStroke();
+    gc.fill(255,245,220, 200*this.bloomP); gc.ellipse(0,0, ps*0.6, ps*0.6);
+    gc.pop();
+
+    for (const s of this.particles) s.draw(mc, gc);
+  }
+}
+
+/* ---------- Spore ---------- */
+
+class Spore {
+  constructor(x, y, colorIdx, depth) {
+    this.x=x; this.y=y;
+    this.vx=random(-0.4,0.4); this.vy=random(-1.4,-0.4);
+    this.life=1.0; this.decay=random(0.003,0.008);
+    this.size=random(2,5)*depth;
+    this.color=PALETTE[colorIdx]; this.dead=false; this.phase=random(TWO_PI);
+  }
+  update() {
+    this.x += this.vx + sin(millis()*0.001+this.phase)*0.3;
+    this.y += this.vy;
+    this.vy*=0.99; this.vx*=0.99;
+    this.life-=this.decay;
+    if (this.life<=0) this.dead=true;
+  }
+  draw(mc, gc) {
+    const a=this.life*255;
+    mc.noStroke(); mc.fill(this.color[0],this.color[1],this.color[2],a*0.7);
+    mc.ellipse(this.x,this.y,this.size,this.size);
+    gc.noStroke();
+    for (let i=3;i>0;i--) {
+      gc.fill(this.color[0],this.color[1],this.color[2],a*0.25/i);
+      gc.ellipse(this.x,this.y,this.size*i*2.2,this.size*i*2.2);
+    }
+  }
+}
+
+/* ---------- AmbientParticle ---------- */
+
+class AmbientParticle {
+  constructor() { this.reset(true); }
+  reset(initial=false) {
+    this.x=random(width);
+    this.y=initial ? random(height) : random(height, height+60);
+    this.vx=random(-0.15,0.15); this.vy=random(-0.4,-0.1);
+    this.size=random(0.6,2.4); this.life=random(0.4,1.0);
+    this.maxLife=this.life; this.phase=random(TWO_PI);
+    this.color = random()<0.35
+      ? [...PALETTE[floor(random(PALETTE.length))]]
+      : [240,235,220];
+  }
+  update() {
+    const breath = 0.5 + bloomAmount*1.2;
+    this.x += this.vx + sin(millis()*0.0008+this.phase)*0.15;
+    this.y += this.vy * breath;
+    this.life -= 0.001;
+    if (this.y<-10 || this.life<=0) this.reset(false);
+  }
+  draw(layer) {
+    const a=(this.life/this.maxLife)*180;
+    layer.noStroke();
+    layer.fill(this.color[0],this.color[1],this.color[2],a*0.5);
+    layer.ellipse(this.x,this.y,this.size*3,this.size*3);
+    layer.fill(this.color[0],this.color[1],this.color[2],a);
+    layer.ellipse(this.x,this.y,this.size,this.size);
+  }
+}
+
+function easeOutCubic(t) { return 1 - Math.pow(1-t, 3); }
+
+/* ---------- Start ---------- */
+
+document.getElementById('intro').addEventListener('click', async () => {
+  document.getElementById('intro').classList.add('hidden');
+  try { await startCamera(); }
+  catch(err) {
+    console.error(err);
+    alert('Could not access webcam. Please allow camera permissions and reload.');
+  }
+});
+</script>
+</body>
+</html>
